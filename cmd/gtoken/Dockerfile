@@ -34,6 +34,8 @@ RUN make
 # ------ get latest CA certificates
 #
 FROM alpine:3.15 as certs
+RUN addgroup -S -g 9000 gtoken
+RUN adduser -S -g 9000 -u 9000 gtoken
 RUN apk --update add ca-certificates
 # this is for debug only Alpine image
 COPY --from=build /go/src/gtoken/.bin/github.com/doitintl/gtoken /gtoken
@@ -46,8 +48,12 @@ FROM scratch
 
 # copy CA certificates
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-
+# copy /etc/passwd and /etc/group
+COPY --from=certs /etc/passwd /etc/passwd
+COPY --from=certs /etc/group /etc/group
 # this is the last commabd since it's never cached
 COPY --from=build /go/src/gtoken/.bin/github.com/doitintl/gtoken /gtoken
+
+USER 9000:9000
 
 ENTRYPOINT ["/gtoken"]
