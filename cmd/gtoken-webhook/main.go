@@ -78,21 +78,16 @@ type mutatingWebhook struct {
 
 var logger *log.Logger
 
-// Returns an int >= min, < max
-func randomInt(min, max int) int {
-	//nolint:gosec
-	return min + rand.Intn(max-min)
-}
-
 // Generate a random string of a-z chars with len = l
 func randomString(l int) string {
 	if testMode {
 		return strings.Repeat("0", 16)
 	}
-	rand.Seed(time.Now().UnixNano())
+	//nolint: gosec
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	bytes := make([]byte, l)
 	for i := 0; i < l; i++ {
-		bytes[i] = byte(randomInt(97, 122))
+		bytes[i] = byte(r.Intn(26) + 97)
 	}
 	return string(bytes)
 }
@@ -108,17 +103,6 @@ func newK8SClient() (kubernetes.Interface, error) {
 
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
-}
-
-func serveMetrics(addr string) {
-	logger.Infof("Telemetry on http://%s", addr)
-
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	err := http.ListenAndServe(addr, mux)
-	if err != nil {
-		logger.WithError(err).Fatal("error serving telemetry")
-	}
 }
 
 func handlerFor(config mutating.WebhookConfig, recorder wh.MetricsRecorder, logger *log.Logger) http.Handler {
@@ -352,19 +336,44 @@ func runWebhook(c *cli.Context) error {
 	tlsCertFile := c.String("tls-cert-file")
 	tlsPrivateKeyFile := c.String("tls-private-key-file")
 
-	if len(telemetryAddress) > 0 {
+	if telemetryAddress != "" {
 		// Serving metrics without TLS on separated address
-		go serveMetrics(telemetryAddress)
+		go func() {
+			metricsMux := http.NewServeMux()
+			metricsMux.Handle("/metrics", promhttp.Handler())
+
+			metricsSrv := &http.Server{
+				Addr:         telemetryAddress,
+				Handler:      metricsMux,
+				ReadTimeout:  10 * time.Second,
+				WriteTimeout: 10 * time.Second,
+				IdleTimeout:  120 * time.Second,
+			}
+
+			logger.Infof("listening on telemetry http://%s", telemetryAddress)
+			if err = metricsSrv.ListenAndServe(); err != nil {
+				logger.WithError(err).Fatal("error serving telemetry metrics")
+			}
+		}()
 	} else {
 		mux.Handle("/metrics", promhttp.Handler())
 	}
 
+	// Create an HTTP server for the webhook
+	srv := &http.Server{
+		Addr:         listenAddress,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
 	if tlsCertFile == "" && tlsPrivateKeyFile == "" {
 		logger.Infof("listening on http://%s", listenAddress)
-		err = http.ListenAndServe(listenAddress, mux)
+		err = srv.ListenAndServe()
 	} else {
 		logger.Infof("listening on https://%s", listenAddress)
-		err = http.ListenAndServeTLS(listenAddress, tlsCertFile, tlsPrivateKeyFile, mux)
+		err = srv.ListenAndServeTLS(tlsCertFile, tlsPrivateKeyFile)
 	}
 
 	if err != nil {
