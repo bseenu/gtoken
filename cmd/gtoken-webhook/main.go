@@ -113,7 +113,7 @@ func (cl *certLoader) watch(stopCh <-chan struct{}) {
 	// Watch directory where secret is mounted
 	certDir := filepath.Dir(cl.certPath)
 	if err := watcher.Add(certDir); err != nil {
-		logger.WithError(err).Fatalf("failed to add watcher for cert at path: %v", certDir)
+		logger.WithError(err).Fatalf("failed to add watcher for cert at path: %s", certDir)
 	}
 
 	logger.Infof("watching directory %s for TLS cert changes", certDir)
