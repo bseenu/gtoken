@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -70,66 +71,66 @@ const (
 	limitsMemory   = "50Mi"
 )
 
-type certReloader struct {
+type certLoader struct {
 	certPath string
 	keyPath  string
 	mu       sync.RWMutex
 	cert     *tls.Certificate
 }
 
-func newCertReloader(certPath, keyPath string) (*certReloader, error) {
-	cr := &certReloader{certPath: certPath, keyPath: keyPath}
-	if err := cr.reload(); err != nil {
+func newCertLoader(certPath, keyPath string) (*certLoader, error) {
+	cl := &certLoader{certPath: certPath, keyPath: keyPath}
+	if err := cl.loadCert(); err != nil {
 		return nil, err
 	}
-	return cr, nil
+	return cl, nil
 }
 
-func (cr *certReloader) reload() error {
-	cert, err := tls.LoadX509KeyPair(cr.certPath, cr.keyPath)
+func (cl *certLoader) loadCert() error {
+	cert, err := tls.LoadX509KeyPair(cl.certPath, cl.keyPath)
 	if err != nil {
 		return err
 	}
-	cr.mu.Lock()
-	cr.cert = &cert
-	cr.mu.Unlock()
-	logger.Infof("reloaded TLS certificate")
+	cl.mu.Lock()
+	cl.cert = &cert
+	cl.mu.Unlock()
 	return nil
 }
 
-func (cr *certReloader) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-	cr.mu.RLock()
-	defer cr.mu.RUnlock()
-	return cr.cert, nil
+func (cl *certLoader) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	cl.mu.RLock()
+	defer cl.mu.RUnlock()
+	return cl.cert, nil
 }
 
-func (cr *certReloader) watch(stopCh <-chan struct{}) {
+func (cl *certLoader) watch(stopCh <-chan struct{}) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer watcher.Close()
 
-	// Watch both cert and key
-	if err := watcher.Add(cr.certPath); err != nil {
-		log.Fatal(err)
+	// Watch directory where secret is mounted
+	certDir := filepath.Dir(cl.certPath)
+	if err := watcher.Add(certDir); err != nil {
+		logger.WithError(err).Fatalf("failed to add watcher for cert at path: %v", certDir)
 	}
-	if err := watcher.Add(cr.keyPath); err != nil {
-		log.Fatal(err)
-	}
+
+	logger.Infof("watching directory %s for TLS cert changes", certDir)
 
 	for {
 		select {
 		case event := <-watcher.Events:
-			// Secret projected volumes often replace the whole file → look for Write/Remove/Rename
-			if event.Op&(fsnotify.Write|fsnotify.Remove|fsnotify.Rename|fsnotify.Create) != 0 {
+			// Secret projected volumes often replace ..data directory, watch for create for it
+			if event.Op&fsnotify.Create != 0 && filepath.Base(event.Name) == "..data" {
 				logger.Warnf("cert/key file changed (%s), reloading...", event)
-				if err := cr.reload(); err != nil {
+				if err := cl.loadCert(); err != nil {
 					logger.WithError(err).Error("failed to reload cert")
 				}
+				logger.Infof("reloaded TLS certificate")
 			}
 		case err := <-watcher.Errors:
-			logger.WithError(err).Error("watcher error: %v", err)
+			logger.WithError(err).Error("watcher error")
 		case <-stopCh:
 			logger.Infof("stopping cert watcher")
 			return
@@ -421,6 +422,7 @@ func runWebhook(c *cli.Context) error {
 	listenAddress := c.String("listen-address")
 	tlsCertFile := c.String("tls-cert-file")
 	tlsPrivateKeyFile := c.String("tls-private-key-file")
+	watchCert := c.Bool("watch-cert")
 
 	if len(telemetryAddress) > 0 {
 		// Serving metrics without TLS on separated address
@@ -435,22 +437,27 @@ func runWebhook(c *cli.Context) error {
 	}
 	if tlsCertFile == "" && tlsPrivateKeyFile == "" {
 		logger.Infof("listening on http://%s", listenAddress)
-		err = srv.ListenAndServe()
+		if err := srv.ListenAndServe(); err != nil {
+			logger.WithError(err).Fatal("error serving webhook")
+		}
 	} else {
-		cr, err := newCertReloader(tlsCertFile, tlsPrivateKeyFile)
+		cl, err := newCertLoader(tlsCertFile, tlsPrivateKeyFile)
 		if err != nil {
 			logger.WithError(err).Fatal("failed to load TLS certs")
 		}
-
-		stopCh := make(chan struct{})
-		go cr.watch(stopCh) // background watcher
+		if watchCert {
+			stopCh := make(chan struct{})
+			go cl.watch(stopCh) // background watcher
+		}
 
 		srv.TLSConfig = &tls.Config{
-			GetCertificate: cr.getCertificate,
+			GetCertificate: cl.getCertificate,
 			MinVersion:     tls.VersionTLS12,
 		}
 		logger.Infof("listening on https://%s", listenAddress)
-		err = srv.ListenAndServeTLS("", "")
+		if err := srv.ListenAndServeTLS("", ""); err != nil {
+			logger.WithError(err).Fatal("error serving webhook")
+		}
 	}
 
 	if err != nil {
@@ -535,6 +542,10 @@ func main() {
 					Name:  "token-file",
 					Usage: "token file name",
 					Value: tokenFileName,
+				},
+				cli.BoolFlag{
+					Name:  "watch-cert",
+					Usage: "watch certificate and reload then when changes",
 				},
 			},
 			Usage:       "mutation admission webhook",
