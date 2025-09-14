@@ -121,7 +121,7 @@ func (cl *certLoader) watch(stopCh <-chan struct{}) {
 	for {
 		select {
 		case event := <-watcher.Events:
-			// Secret projected volumes often replace ..data directory, watch for create for it
+			// Secret projected volumes often replace ..data directory, watch for creation of it
 			if event.Op&fsnotify.Create != 0 && filepath.Base(event.Name) == "..data" {
 				logger.Warnf("cert/key file changed (%s), reloading...", event)
 				if err := cl.loadCert(); err != nil {
